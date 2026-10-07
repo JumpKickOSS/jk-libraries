@@ -9,6 +9,9 @@ Checks:
   4. Short names use a sensible identifier form.
   5. No redundant vendor/org prefix when the bare artifactId is already a
      distinctive, free short name (the `nats-jnats` anti-pattern).
+  6. Every [packages] row is `"package.prefix" = "short-name"`, its prefix
+     appears once, and its short name is a library of [libraries] (jk refuses
+     a catalog whose [packages] row names anything else).
 
 Exit 0 on success, 1 on any violation. Stdlib only.
 """
@@ -28,6 +31,9 @@ ENTRY_RE = re.compile(
     r"^([a-zA-Z][a-zA-Z0-9_.+-]*)\s*=\s*\"([^\"]+)\"\s*$"
 )
 NAME_RE = re.compile(r"^[a-z][a-z0-9]*(-[a-z0-9]+)*$")
+
+# Lines under [packages]: a quoted Java package prefix naming a short name.
+PACKAGE_RE = re.compile(r"^\"([a-z_][a-z0-9_]*(?:\.[a-z_][a-z0-9_]*)*)\"\s*=\s*\"([^\"]+)\"\s*$")
 
 # ArtifactIds that are too generic / module-ish / service-like to stand alone
 # as a short name. Prefixed forms (aws-sdk-s3, zxing-core, …) are expected.
@@ -185,11 +191,18 @@ FAMILY_PREFIXES = {
 }
 
 
-def parse_registry(path: Path) -> tuple[list[tuple[str, str, str, int]], list[str]]:
-    """Return (entries, errors). entries are (name, group, artifact, line_no)."""
+def parse_registry(
+    path: Path,
+) -> tuple[list[tuple[str, str, str, int]], list[tuple[str, str, int]], list[str]]:
+    """Return (entries, packages, errors).
+
+    entries are (name, group, artifact, line_no); packages are (prefix, name, line_no).
+    """
     errors: list[str] = []
     entries: list[tuple[str, str, str, int]] = []
-    in_libraries = False
+    packages: list[tuple[str, str, int]] = []
+    table = None
+    seen_libraries = False
 
     text = path.read_text(encoding="utf-8")
     for line_no, raw in enumerate(text.splitlines(), 1):
@@ -197,12 +210,20 @@ def parse_registry(path: Path) -> tuple[list[tuple[str, str, str, int]], list[st
         if not line or line.startswith("#"):
             continue
         if line.startswith("["):
-            in_libraries = line == "[libraries]"
-            if line != "[libraries]" and not line.startswith("[libraries."):
-                # Allow only the [libraries] table for now.
+            table = line
+            if line == "[libraries]":
+                seen_libraries = True
+            elif line != "[packages]":
                 errors.append(f"L{line_no}: unexpected table {line!r}")
             continue
-        if not in_libraries:
+        if table == "[packages]":
+            pm = PACKAGE_RE.match(line)
+            if not pm:
+                errors.append(f"L{line_no}: unparseable [packages] row: {line}")
+                continue
+            packages.append((pm.group(1), pm.group(2), line_no))
+            continue
+        if table != "[libraries]":
             errors.append(f"L{line_no}: entry outside [libraries]: {line}")
             continue
 
@@ -225,9 +246,26 @@ def parse_registry(path: Path) -> tuple[list[tuple[str, str, str, int]], list[st
             continue
         entries.append((name, group, artifact, line_no))
 
-    if not in_libraries and not entries:
+    if not seen_libraries:
         errors.append("missing [libraries] table")
-    return entries, errors
+    return entries, packages, errors
+
+
+def check_packages(
+    entries: list[tuple[str, str, str, int]], packages: list[tuple[str, str, int]]
+) -> list[str]:
+    """Each [packages] prefix appears once and names a library of [libraries]."""
+    names = {name for name, _, _, _ in entries}
+    errors: list[str] = []
+    first: dict[str, int] = {}
+    for prefix, name, line_no in packages:
+        if prefix in first:
+            errors.append(f"L{line_no}: package {prefix!r} already mapped at line {first[prefix]}")
+        else:
+            first[prefix] = line_no
+        if name not in names:
+            errors.append(f"L{line_no}: package {prefix!r} names {name!r}, which is not a library in [libraries]")
+    return errors
 
 
 def prefix_is_from_group(prefix: str, group: str) -> bool:
@@ -344,13 +382,14 @@ def main() -> int:
         print(f"error: registry not found: {REGISTRY}", file=sys.stderr)
         return 1
 
-    entries, errors = parse_registry(REGISTRY)
+    entries, packages, errors = parse_registry(REGISTRY)
     if not entries and not errors:
         errors.append("no library entries found")
 
     errors.extend(check_uniqueness(entries))
     errors.extend(check_name_form(entries))
     errors.extend(check_redundant_vendor_prefix(entries))
+    errors.extend(check_packages(entries, packages))
 
     if errors:
         print(f"libraries.toml: {len(errors)} issue(s):\n", file=sys.stderr)
@@ -358,7 +397,7 @@ def main() -> int:
             print(f"  • {e}", file=sys.stderr)
         return 1
 
-    print(f"OK: {len(entries)} libraries in {REGISTRY.relative_to(ROOT)}")
+    print(f"OK: {len(entries)} libraries and {len(packages)} package rows in {REGISTRY.relative_to(ROOT)}")
     return 0
 
 
